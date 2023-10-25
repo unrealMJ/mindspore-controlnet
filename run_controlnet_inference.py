@@ -7,12 +7,15 @@ from cldm.ddim_hacked import PLMSSampler as DDIMSampler
 import mindspore as ms
 from mindspore import ops
 import os
+import argparse
+import time
 
 
 class CannyDetector:
     def __call__(self, img, low_threshold, high_threshold):
         return cv2.Canny(img, low_threshold, high_threshold)
 
+apply_canny = CannyDetector()
 
 def create_model(config_path):
     config = OmegaConf.load(config_path)
@@ -71,25 +74,19 @@ def load_state_dict(model, path='torch2ms/ms_weight'):
     return model
 
 
-device_id = int(os.getenv("DEVICE_ID", 0))
-ms.context.set_context(
-    mode=ms.context.GRAPH_MODE,
-    device_target="GPU",
-    device_id=device_id,
-    max_device_memory="30GB"
-)
+def load_model(config_path, pretrained_path):
+    config = OmegaConf.load(config_path)
+    model = instantiate_from_config(config.model)
+
+    model = load_state_dict(model, path=pretrained_path)
+    ddim_sampler = DDIMSampler(model)
+
+    return model, ddim_sampler
 
 
-apply_canny = CannyDetector()
-
-model = create_model('./configs/cldm_v15.yaml')
-model = load_state_dict(model)
-
-ddim_sampler = DDIMSampler(model)
-
-
-
-def process(input_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, ddim_steps, guess_mode, strength, scale, seed, eta, low_threshold, high_threshold):
+def process(input_path, low_threshold=100, high_threshold=200, image_resolution=512):
+    input_image = Image.open(input_path).convert('RGB')
+    input_image = np.asarray(input_image)
     img = resize_image(HWC3(input_image), image_resolution)
     img = input_image
     H, W, C = img.shape
@@ -97,15 +94,28 @@ def process(input_image, prompt, a_prompt, n_prompt, num_samples, image_resoluti
     detected_map = apply_canny(img, low_threshold, high_threshold)
     detected_map = HWC3(detected_map)
 
+    return img, detected_map
+
+
+def inference(control, config_path, pretrained_path,
+              prompt, n_prompt, num_samples, 
+              ddim_steps, guess_mode, strength, scale, eta, 
+              width=512, height=512):
+    
+    control_map = control.copy()
+
+    # load model
+    model, ddim_sampler = load_model(config_path=config_path, pretrained_path=pretrained_path)
+
+    # process control map
     # 这里不使用permute，使用numpy transpose或者mindspore transpose
-    # control = ms.Tensor(detected_map.copy()).float() / 255.0
-    control = np.transpose(detected_map.copy(), (2, 0, 1))
+    control = np.transpose(control.copy(), (2, 0, 1))
     control = ms.Tensor(control.copy()) / 255.0
     control = ops.stack([control for _ in range(num_samples)], axis=0)
 
-    cond = {"c_concat": [control], "c_crossattn": [model.get_learned_conditioning([prompt + ', ' + a_prompt] * num_samples)]}
+    cond = {"c_concat": [control], "c_crossattn": [model.get_learned_conditioning([prompt] * num_samples)]}
     un_cond = {"c_concat": None if guess_mode else [control], "c_crossattn": [model.get_learned_conditioning([n_prompt] * num_samples)]}
-    shape = (4, H // 8, W // 8)
+    shape = (4, height // 8, width // 8)
 
     model.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)  # Magic number. IDK why. Perhaps because 0.825**12<0.01 but 0.826**12>0.01
     samples, intermediates = ddim_sampler.sample(ddim_steps, num_samples,
@@ -118,36 +128,59 @@ def process(input_image, prompt, a_prompt, n_prompt, num_samples, image_resoluti
     x_samples = x_samples.asnumpy().copy().clip(0, 255).astype(np.uint8)
 
     results = [x_samples[i] for i in range(num_samples)]
-    return [255 - detected_map] + results
+    return [255 - control_map] + results
 
 
-image = Image.open('input_image.png').convert('RGB')
-image = np.asarray(image)
-prompt = 'a girl'
-a_prompt = 'best quality, extremely detailed'
-n_prompt = 'longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality'
-num_samples = 1
-image_resolution = 512
-ddim_steps = 20
-guess_mode = False
-strength = 1.0
-scale = 9.0
-seed = -1
-eta = 0.0
-low_threshold = 100
-high_threshold = 200
-
-result = process(image, prompt, a_prompt, n_prompt, num_samples, image_resolution, ddim_steps, guess_mode, strength, scale, seed, eta, low_threshold, high_threshold)
-
-
-def save(results):
+def save(results, output_path):
     control = results[0]
     samples = results[1:]
 
-    os.makedirs('output/controlnet', exist_ok=True)
+    dt_string = time.strftime("%Y-%m-%d-%H-%M-%S")
+    os.makedirs(f'{output_path}/{dt_string}', exist_ok=True)
     
-    Image.fromarray(control).save('output/controlnet/control.png')
+    Image.fromarray(control).save(f'{output_path}/{dt_string}/control.png')
     for i in range(len(samples)):
-        Image.fromarray(samples[i]).save(f'output/controlnet/sample_{i}.png')
+        Image.fromarray(samples[i]).save(f'{output_path}/{dt_string}/sample_{i}.png')
 
-save(result)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--pretrained_path', default='torch2ms/ms_weight', type=str)
+    parser.add_argument('--config_path', default='configs/cldm_v15.yaml', type=str)
+    parser.add_argument('--input_path', default=None, type=str)
+    parser.add_argument(
+        '--prompt', 
+        default='a girl,best quality,extremely detailed', 
+        type=str
+    )
+    parser.add_argument(
+        '--negative_prompt', 
+        default='longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality', 
+        type=str
+    )
+    parser.add_argument('--output_path', default='output/controlnet', type=str)
+    parser.add_argument('--num_samples', default=1, type=int)
+    parser.add_argument('--image_resolution', default=512, type=int)
+    parser.add_argument('--ddim_steps', default=20, type=int)
+    parser.add_argument('--guess_mode', default=False, type=bool)
+    parser.add_argument('--strength', default=1.0, type=float)
+    parser.add_argument('--scale', default=9.0, type=float)
+    parser.add_argument('--eta', default=0.0, type=float)
+
+    args = parser.parse_args()
+
+    
+    device_id = int(os.getenv("DEVICE_ID", 0))
+    ms.context.set_context(
+        mode=ms.context.GRAPH_MODE,
+        device_target="GPU",
+        device_id=device_id,
+        max_device_memory="30GB"
+    )
+
+    _, control_map = process(args.input_path)
+    results = inference(control_map, args.config_path, args.pretrained_path,
+                        args.prompt, args.negative_prompt, args.num_samples, 
+                        args.ddim_steps, args.guess_mode, args.strength, args.scale, args.eta)
+    
+    save(results, args.output_path)
