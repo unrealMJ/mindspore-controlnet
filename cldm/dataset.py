@@ -26,9 +26,10 @@ import imagesize
 import mindspore as ms
 from mindspore.dataset import GeneratorDataset
 
-from ldm.data.t2i_collate import t2i_collate, data_column
+# from ldm.data.t2i_collate import t2i_collate, data_column
 
 from toolz.sandbox import unzip
+
 def control_collate(inputs):
     """
     Return:
@@ -42,6 +43,12 @@ def control_collate(inputs):
         'control_feat': control_feat
     }
     return batch
+
+data_column = [
+    'img_feat',
+    'txt_tokens',
+    'control_feat'
+]
 
 
 def load_data(
@@ -60,10 +67,11 @@ def load_data(
     
     if not os.path.exists(data_path):
         raise ValueError("Data directory does not exist!")
-    all_images, all_captions = list_image_files_captions_recursively(data_path)
-    if filter_small_size:
-        print(f"Filter small images, filter size: {image_filter_size}")
-        all_images, all_captions = filter_small_image(all_images, all_captions, image_filter_size)
+    # all_images, all_captions = list_image_files_captions_recursively(data_path)
+    all_images, all_captions, all_conds = list_image_files_captions_recursively(data_path)
+    # if filter_small_size:
+    #     print(f"Filter small images, filter size: {image_filter_size}")
+    #     all_images, all_captions = filter_small_image(all_images, all_captions, image_filter_size)
     print(f"The first image path is {all_images[0]}, and the caption is {all_captions[0]}")
     print(f"total data num: {len(all_images)}")
     dataloaders = {}
@@ -71,6 +79,7 @@ def load_data(
             batch_size,
             all_images,
             all_captions,
+            all_conds,
             tokenizer,
             image_size,
             image_filter_size,
@@ -78,7 +87,7 @@ def load_data(
             filter_small_size=filter_small_size
             )
     datalen = dataset.__len__
-    loader = build_dataloader_ft(dataset, datalen, t2i_collate, batch_size, device_num, rank_id=rank_id)
+    loader = build_dataloader_ft(dataset, datalen, control_collate, batch_size, device_num, rank_id=rank_id)
     dataloaders["ftT2I"] = loader
     if sample_num==-1:
         batchlen = datalen//(batch_size * device_num)
@@ -90,38 +99,26 @@ def load_data(
     return dataset
 
 
-def build_dataloader_ft(dataset, datalens,collate_fn, batch_size, device_num, rank_id=0):
+def build_dataloader_ft(dataset, datalens, collate_fn, batch_size, device_num, rank_id=0):
     sampler = BatchSampler(datalens, batch_size=batch_size, device_num=device_num)
     loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_fn, device_num=device_num, drop_last=True, rank_id=rank_id)
     return loader
 
 
 def list_image_files_captions_recursively(data_path):
-        anno_dir = data_path
-        anno_list = sorted([os.path.join(anno_dir, f) for f in list(filter(lambda x: x.endswith(".csv"), os.listdir(anno_dir)))])
-        db_list = [pd.read_csv(f) for f in anno_list]
-        all_images = []
-        all_captions = []
-        for db in db_list:
-            all_images.extend(list(db["dir"]))
-            all_captions.extend(list(db["text"]))
-        assert len(all_images) == len(all_captions)
-        all_images = [os.path.join(data_path, f) for f in all_images]
-
-        return all_images, all_captions
-
-
-def filter_small_image(all_images, all_captions, image_filter_size):
-    filted_images = []
-    filted_captions = []
-    for image, caption in zip(all_images, all_captions):
-        w, h = imagesize.get(image)
-        if min(w, h) < image_filter_size:
-            continue
-        else:
-            filted_images.append(image)
-            filted_captions.append(caption)
-    return filted_images, filted_captions
+    import json
+    all_images = []
+    all_conds = []
+    all_captions = []
+    with open(f'{data_path}/train.jsonl', 'r') as f:
+        for line in f:
+            data = json.loads(line)
+            all_images.append(f'{data_path}/{data["image"]}')
+            all_conds.append(f'{data_path}/{data["conditioning_image"]}')
+            all_captions.append(data["text"])
+    
+    assert len(all_images) == len(all_captions)
+    return all_images, all_captions, all_conds
 
 
 class ImageDataset():
@@ -130,6 +127,7 @@ class ImageDataset():
         batch_size,
         image_paths,
         captions,
+        conds,
         tokenizer,
         image_size,
         image_filter_size,
@@ -144,18 +142,19 @@ class ImageDataset():
         self.image_filter_size = image_filter_size
         self.local_images = image_paths
         self.local_captions = captions
+        self.local_control = conds
         self.shuffle = shuffle
         self.random_crop = random_crop
         self.filter_small_size = filter_small_size
 
-        self.rescaler = albumentations.SmallestMaxSize(max_size = self.image_size)
-        if not self.random_crop:
-            self.cropper = albumentations.CenterCrop(height=self.image_size,width=self.image_size)
-            self.preprocessor = albumentations.Compose([self.rescaler, self.cropper])
-        else:
-            self.cropper = albumentations.RandomCrop(height=self.image_size,width=self.image_size)
-            self.preprocessor = albumentations.Compose([self.rescaler, self.cropper, albumentations.HorizontalFlip(p=0.5)])
-            print("apply random crop and horizontal flip")
+        # self.rescaler = albumentations.SmallestMaxSize(max_size = self.image_size)
+        # if not self.random_crop:
+        #     self.cropper = albumentations.CenterCrop(height=self.image_size,width=self.image_size)
+        #     self.preprocessor = albumentations.Compose([self.rescaler, self.cropper])
+        # else:
+        #     self.cropper = albumentations.RandomCrop(height=self.image_size,width=self.image_size)
+        #     self.preprocessor = albumentations.Compose([self.rescaler, self.cropper, albumentations.HorizontalFlip(p=0.5)])
+        #     print("apply random crop and horizontal flip")
 
     @property
     def __len__(self):
@@ -184,7 +183,7 @@ class ImageDataset():
         # control
         control_path = self.local_control[idx]
         control = Image.open(control_path).convert('RGB')
-        control = control.astype(np.float32)
+        control = np.asarray(control).astype(np.float32)
         control = control / 255.0
 
         # caption preprocess
@@ -192,18 +191,11 @@ class ImageDataset():
         caption_input = self.tokenize(caption)
         return np.array(img, dtype=np.float32), np.array(caption_input, dtype=np.int32), np.array(control, dtype=np.float32)
 
-    # def preprocess_image(self, image_path):
-    #     image = Image.open(image_path)
-    #     if not image.mode == "RGB":
-    #         image = image.convert("RGB")
-    #     image = np.array(image).astype(np.uint8)
-    #     image = self.preprocessor(image=image)["image"]
-    #     image = (image/127.5 - 1.0).astype(np.float32)
-    #     return image
-
     def tokenize(self, text):
-        SOT_TEXT = "[CLS]"
-        EOT_TEXT = "[SEP]"
+        # SOT_TEXT = "[CLS]"
+        # EOT_TEXT = "[SEP]"
+        SOT_TEXT = "<|startoftext|>"
+        EOT_TEXT = "<|endoftext|>"
         CONTEXT_LEN = 77
 
         sot_token = self.tokenizer.encoder[SOT_TEXT]
@@ -316,7 +308,8 @@ class MetaLoader():
         batch = defaultdict(lambda: None, batch)
         img_feat = batch.get('img_feat', None)
         txt_tokens = batch.get('txt_tokens', None)
-        output = (img_feat, txt_tokens)
+        control_feat = batch.get('control_feat', None)
+        output = (img_feat, txt_tokens, control_feat)
 
         return output
 

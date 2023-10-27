@@ -7,6 +7,8 @@ torch2ms/numpy_weight/
 
 model_struct/
 
+dataset/
+
 demo/
 
 output/

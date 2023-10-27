@@ -16,7 +16,7 @@ from mindspore.nn.wrap.loss_scale import DynamicLossScaleUpdateCell
 from mindspore.communication.management import init, get_rank, get_group_size
 from mindspore.train.callback import LossMonitor, TimeMonitor, CheckpointConfig, ModelCheckpoint
 
-from ldm.data.dataset import load_data
+from cldm.dataset import load_data
 from ldm.modules.train.optim import build_optimizer
 from ldm.modules.train.callback import OverflowMonitor
 from ldm.modules.train.learningrate import LearningRate
@@ -53,7 +53,7 @@ def init_env(opts):
         opts.rank = rank_id
 
     context.set_context(mode=context.GRAPH_MODE,
-                        device_target="Ascend",
+                        device_target="GPU",
                         device_id=device_id,
                         max_device_memory="30GB",
                         )
@@ -119,8 +119,8 @@ def load_pretrained_model(path='torch2ms/ms_weight', model=None):
     text_encoder_weight = ms.load_checkpoint(os.path.join(path, 'text_encoder.ckpt'))
     param_not_load.extend(ms.load_param_into_net(model.cond_stage_model, text_encoder_weight))
 
-    controlnet_weight = ms.load_checkpoint(os.path.join(path, 'controlnet.ckpt'))
-    param_not_load.extend(ms.load_param_into_net(model.control_model, controlnet_weight))
+    # controlnet_weight = ms.load_checkpoint(os.path.join(path, 'controlnet.ckpt'))
+    # param_not_load.extend(ms.load_param_into_net(model.control_model, controlnet_weight))
 
     print("param not load:", param_not_load)
     
@@ -134,8 +134,15 @@ def main(opts):
     # TODO: complete init_env function
     dataset, rank_id, device_id, device_num = init_env(opts)
     CLDMWithLoss = instantiate_from_config(opts.model_config)
-    pretrained_ckpt = os.path.join(opts.pretrained_model_path, opts.pretrained_model_file)
-    load_pretrained_model(pretrained_ckpt, CLDMWithLoss)
+    # pretrained_ckpt = os.path.join(opts.pretrained_model_path, CLDMWithLoss)
+    CLDMWithLoss = load_pretrained_model(opts.pretrained_model_path, CLDMWithLoss)
+
+    # fix SD
+    for k, v in CLDMWithLoss.parameters_and_names():
+        if k.startswith("control_model"):
+            v.requires_grad = True
+        else:
+            v.requires_grad = False
 
     if not opts.decay_steps:
         dataset_size = dataset.get_dataset_size()
@@ -188,15 +195,15 @@ if __name__ == "__main__":
     parser.add_argument('--use_parallel', default=False, type=str2bool, help='use parallel')
     parser.add_argument('--data_path', default="dataset", type=str, help='data path')
     parser.add_argument('--output_path', default="output/", type=str, help='use audio out')
-    parser.add_argument('--train_config', default="configs/train_config.json", type=str, help='train config path')
+    parser.add_argument('--train_config', default="configs/train_controlnet_config.json", type=str, help='train config path')
     parser.add_argument('--model_config', default="configs/v1-train-chinese.yaml", type=str, help='model config path')
     parser.add_argument('--pretrained_model_path', default="", type=str, help='pretrained model directory')
-    parser.add_argument('--pretrained_model_file', default="", type=str, help='pretrained model file name')
+    # parser.add_argument('--pretrained_model_file', default="", type=str, help='pretrained model file name')
     
     parser.add_argument('--optim', default="adamw", type=str, help='optimizer')
     parser.add_argument('--seed', default=3407, type=int, help='data path')
     parser.add_argument('--warmup_steps', default=1000, type=int, help='warmup steps')
-    parser.add_argument('--train_batch_size', default=10, type=int, help='batch size')
+    parser.add_argument('--train_batch_size', default=1, type=int, help='batch size')
     parser.add_argument('--callback_size', default=1, type=int, help='callback size.')
     parser.add_argument("--start_learning_rate", default=1e-5, type=float,help="The initial learning rate for Adam.")
     parser.add_argument("--end_learning_rate", default=1e-7, type=float, help="The end learning rate for Adam.")

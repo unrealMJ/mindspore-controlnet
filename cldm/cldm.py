@@ -19,15 +19,19 @@ class ControlledUnetModel(UNetModel):
         
         # control = []
         # split api 与2.0不同
-        control = ms.ops.split(control_1, axis=0, output_num=control_1.shape[0]) \
-                + ms.ops.split(control_2, axis=0, output_num=control_2.shape[0]) \
-                + ms.ops.split(control_3, axis=0, output_num=control_3.shape[0]) \
-                + ms.ops.split(control_4, axis=0, output_num=control_4.shape[0]) \
-                + ms.ops.split(control_5, axis=0, output_num=control_5.shape[0]) \
-                + ms.ops.split(control_6, axis=0, output_num=control_6.shape[0])
-        control = list(control)
-
+        control = []
+        if control_1 is not None:
+            control = ms.ops.split(control_1, axis=0, output_num=control_1.shape[0]) \
+                    + ms.ops.split(control_2, axis=0, output_num=control_2.shape[0]) \
+                    + ms.ops.split(control_3, axis=0, output_num=control_3.shape[0]) \
+                    + ms.ops.split(control_4, axis=0, output_num=control_4.shape[0]) \
+                    + ms.ops.split(control_5, axis=0, output_num=control_5.shape[0]) \
+                    + ms.ops.split(control_6, axis=0, output_num=control_6.shape[0])
+            control = list(control)
         hs = []
+
+        # for i, each in enumerate(control):
+        #     print(f'i: {i}, control.shape: {each.shape}')
 
         # mindspore不需要包装torch.no_grad()
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
@@ -43,27 +47,29 @@ class ControlledUnetModel(UNetModel):
             h = module(h, emb, context)
 
         control_idx = -1
-        if control is not None:
+        if len(control) != 0:
             h += control[control_idx]
             control_idx -= 1
         
-
         only_mid_control = False
         hs_idx = -1
         # TODO: check all tensor dtype
         for i, module in enumerate(self.output_blocks):
-            if only_mid_control or control is None:
+            if only_mid_control or len(control) == 0:
                 h = ms.ops.concat([h, hs[hs_idx].astype(h.dtype)], axis=1)
             else:
                 h = ms.ops.concat([h, hs[hs_idx].astype(h.dtype) + control[control_idx].astype(h.dtype)], axis=1)
+                # print(f'control_idx: {control_idx}, h.shape: {h.shape}, hs[hs_idx].shape: {hs[hs_idx].shape}, control[control_idx].shape: {control[control_idx].shape}')
                 control_idx -= 1
                 hs_idx -= 1
-            # h = module(h, emb, context)
             for cell in module:
                 h = cell(h, emb, context)
 
         # # h = h.astype(x.dtype)
         return self.out(h)
+        # h = ms.ops.interpolate(h, mode='bilinear', sizes=(64,64))
+        # h = h[:, :4, :, :]
+        # return h
     
 
 class ControlNet(nn.Cell):
@@ -300,7 +306,7 @@ class ControlNet(nn.Cell):
     def make_zero_conv(self, channels):
         return nn.SequentialCell([
             zero_module(
-                conv_nd(self.dims, channels, channels, 1, padding=0, has_bias=True, pad_mode='pad')
+                conv_nd(self.dims, channels, channels, 1, padding=0, has_bias=True, pad_mode='pad').to_float(self.dtype)
             )
         ])
 
@@ -342,10 +348,6 @@ class ControlLDM(LatentDiffusion):
         self.control_key = control_key
         self.only_mid_control = only_mid_control
         self.control_scales = [1.0] * 13
-    
-    def get_input(self, x, c):
-        # TODO: support train
-        pass
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
         diffusion_model = self.model.diffusion_model
@@ -353,7 +355,11 @@ class ControlLDM(LatentDiffusion):
         cond_txt = ms.ops.concat(cond['c_crossattn'], 1)
 
         if cond['c_concat'] is None:
-            pass
+            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, 
+                                  control_1=None, control_2=None,
+                                  control_3=None, control_4=None,
+                                  control_5=None, control_6=None,
+                                  )
         else:
             control = self.control_model(x=x_noisy, hint=ms.ops.concat(cond['c_concat'], 1), timesteps=t, 
                                          context=cond_txt)
@@ -376,3 +382,41 @@ class ControlLDM(LatentDiffusion):
                                   )
         return eps
 
+    def get_input(self, x, c, control):
+        x, c = super().get_input(x, c)
+        
+        control = ms.numpy.transpose(control, (0, 3, 1, 2))
+
+        return x, c, control
+
+    def construct(self, x, c, control):
+        t = ms.ops.UniformInt()((x.shape[0],), ms.Tensor(0, dtype=ms.dtype.int32), ms.Tensor(self.num_timesteps, dtype=ms.dtype.int32))
+        x, c, control = self.get_input(x, c, control)
+        c = self.get_learned_conditioning_fortrain(c)
+        return self.p_losses(x, c, t, control)
+
+    def p_losses(self, x_start, cond, t, control, noise=None):
+        noise = ms.numpy.randn(x_start.shape)
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        tmp = {'c_concat': [control], 'c_crossattn': [cond]}
+        model_output = self.apply_model(x_noisy, t, tmp)
+        # model_output = super().apply_model(x_noisy, t, c_crossattn=cond)
+        
+        if self.parameterization == "x0":
+            target = x_start
+        elif self.parameterization == "eps":
+            target = noise
+        else:
+            raise NotImplementedError()
+
+        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+
+        logvar_t = self.logvar[t]
+        loss = loss_simple / ms.ops.exp(logvar_t) + logvar_t
+        loss = self.l_simple_weight * loss.mean()
+
+        loss_vlb = self.get_loss(model_output, target, mean=False).mean((1, 2, 3))
+        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss += (self.original_elbo_weight * loss_vlb)
+        
+        return loss
