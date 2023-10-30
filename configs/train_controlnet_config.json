@@ -1,8 +1,8 @@
 {
     "model_config": "configs/v1-train-chinese.yaml",
-    "pretrained_model_path": "models/",
+    "pretrained_model_path": "torch2ms/ms_weight",
     "data_path": "/secHome/FFHQ",
-    "train_batch_size": 3,
+    "train_batch_size": 1,
     "gradient_accumulation_steps": 1,
     "optim": "adamw",
     "patch_size":32,
